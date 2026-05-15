@@ -1,92 +1,249 @@
 # opencv_preview
 
+A collection of C++/CMake subprojects demonstrating GPU-accelerated image processing using OpenCV, OpenCL, and CUDA. Each subproject is self-contained with its own `CMakeLists.txt` and builds independently.
 
-## Getting started
+---
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## Repository structure
 
 ```
-cd existing_repo
-git remote add origin https://mygit.th-deg.de/faber_vorl/opencv_preview.git
-git branch -M main
-git push -uf origin main
+opencv_preview/
+├── opencv_0/               # Minimal OpenCV image viewer (no GPU)
+├── parallel_worlds_1/      # OpenCL: grayscale filter on live camera
+├── parallel_worlds_2/      # OpenCL: grayscale + Sobel edge detection
+├── parallel_worlds_3/      # OpenCL: grayscale + Sobel + effect + dehazing  ← main demo
+└── parallel_worlds_2_cuda/ # CUDA: grayscale + Sobel (Linux/Windows only)
 ```
 
-## Integrate with your tools
+---
 
-* [Set up project integrations](https://mygit.th-deg.de/faber_vorl/opencv_preview/-/settings/integrations)
+## Subprojects
 
-## Collaborate with your team
+### `opencv_0` — Basic OpenCV demo
+Loads `preview.png`, displays it in a window, waits for a keypress, saves it as `preview_new.png`.
+- **Depends on:** OpenCV only
+- **Executable:** `opencv_preview`
 
-* [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+### `parallel_worlds_1` — OpenCL grayscale
+Opens webcam (falls back to `preview.png`). Runs a grayscale kernel on the GPU and shows two windows: original and grayscale.
+- **Depends on:** OpenCV, OpenCL
+- **Executable:** `parallel_worlds_1`
 
-## Test and Deploy
+### `parallel_worlds_2` — OpenCL grayscale + Sobel
+Chains grayscale → Sobel edge detection. Two windows.
+- **Depends on:** OpenCV, OpenCL
+- **Executable:** `parallel_worlds_2`
 
-Use the built-in continuous integration in GitLab.
+### `parallel_worlds_3` — OpenCL full pipeline + dehazing ← main demo
+The most complete subproject. Five simultaneous windows, all processed on the GPU via OpenCL each frame. See below for full details.
+- **Depends on:** OpenCV, OpenCL
+- **Executable:** `parallel_worlds_3`
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+### `parallel_worlds_2_cuda` — CUDA grayscale + Sobel
+CUDA equivalent of `parallel_worlds_2`. Always reads from `preview.png` (camera path is disabled in code). Targets SM 75 (Turing-class GPU).
+- **Depends on:** OpenCV, CUDA toolkit
+- **Note:** macOS is not supported — Apple dropped CUDA support. Linux/Windows only.
+- **Executable:** `parallel_worlds`
 
-***
+---
 
-# Editing this README
+## parallel_worlds_3 in detail
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+### What it shows (5 windows)
 
-## Suggestions for a good README
+| Window | What it shows |
+|--------|--------------|
+| `preview` | Raw input — live camera or still image |
+| `converted` | Grayscale using ITU-R BT.709 luminance weights (`grey` kernel) |
+| `edge` | Sobel edge detection on the grayscale image, with tiled local-memory NDRange (`sobel` kernel) |
+| `effect` | Original colour darkened at edge locations (`effectFilter` kernel) |
+| `dehazed` | **Dark Channel Prior dehazing** — haze/fog removal (`darkChannel` + `estimateTransmission` + `recoverRadiance` kernels) |
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+### Dehazing — what was added
 
-## Name
-Choose a self-explaining name for your project.
+The dehazing is an integration of the Dark Channel Prior algorithm (He et al., CVPR 2009) into the existing OpenCL filter pipeline. It was not part of the original project.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+**New files:**
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+| File | Role |
+|------|------|
+| `src/DehazeFilter.hpp` | C++ filter class, follows the same `ImageFilter` subclass pattern as `SobelFilter` and `EffectFilter` |
+| `src/dehazeFilters.cl` | Three OpenCL kernels: `darkChannel`, `estimateTransmission`, `recoverRadiance` |
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+**Modified files:**
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+| File | What changed |
+|------|-------------|
+| `src/main.cpp` | Added `DehazeFilter` instance, `dehazeFrame` buffer, `"dehazed"` window, `--image` CLI flag |
+| `src/CMakeLists.txt` | Removed `-msse2` (x86-only flag, breaks compilation on Apple Silicon ARM64) |
+| `src/OpenCLInterface.hpp` | Added `CL_HPP_TARGET_OPENCL_VERSION 120` — required for macOS, which ships OpenCL 1.2; the bundled `cl2.hpp` header defaults to 2.0 and fails to compile without this |
+| `src/greyImageFilters.cl` | Restored from ROT13 obfuscation to valid OpenCL source |
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+**How the dehazing pipeline works:**
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+1. `darkChannel` kernel (GPU) — finds the minimum BGR value in a 15×15 neighbourhood per pixel
+2. Atmospheric light estimation (CPU) — reads dark channel back, takes the mean of the top 0.1% brightest pixels as the haze colour `A`, capped per-channel at 0.85
+3. `estimateTransmission` kernel (GPU) — computes how much haze is present at each pixel
+4. `recoverRadiance` kernel (GPU) — subtracts the haze and recovers the scene
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+---
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+## Dependencies
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+| Dependency | Used by | Notes |
+|------------|---------|-------|
+| CMake ≥ 3.12 | all | |
+| OpenCV 4.x | all | needs `highgui`, `imgproc` |
+| OpenCL 1.2+ | `parallel_worlds_1/2/3` | see platform notes below |
+| CUDA toolkit | `parallel_worlds_2_cuda` | Linux/Windows only |
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+---
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+## Building and running
 
-## License
-For open source projects, say how it is licensed.
+Every subproject builds independently from its own `src/` directory. The pattern is the same for all of them:
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+```bash
+cd <subproject>/src
+cmake -S . -B ../build
+cmake --build ../build
+cd ../build
+./<executable-name>
+```
+
+The build automatically copies all `.cl` kernel files and `preview.png` next to the executable. **Always run the executable from the `build/` directory**, not from `src/`.
+
+---
+
+### macOS — tested on Apple Silicon (M-series), macOS 14
+
+OpenCL 1.2 ships with macOS via `OpenCL.framework` — no extra install needed. The CUDA warning during CMake configure is harmless (CUDA is not required).
+
+**Install dependencies:**
+
+```bash
+xcode-select --install   # Xcode Command Line Tools — provides clang and OpenCL headers
+brew install opencv
+```
+
+**Build and run `parallel_worlds_3`:**
+
+```bash
+cd parallel_worlds_3/src
+cmake -S . -B ../build
+cmake --build ../build
+cd ../build
+./parallel_worlds_3                          # live camera
+./parallel_worlds_3 --image /path/to/img.jpg # still image
+```
+
+Press any key to quit.
+
+> `parallel_worlds_2_cuda` does **not** build on macOS — Apple removed CUDA support. All other subprojects build and run on macOS.
+
+---
+
+### Linux — x86_64 (not tested; instructions based on code)
+
+You need an OpenCL ICD loader and a vendor-specific OpenCL implementation.
+
+**Install dependencies:**
+
+```bash
+# Ubuntu / Debian
+sudo apt install cmake build-essential libopencv-dev ocl-icd-opencl-dev opencl-headers
+```
+
+For GPU-specific OpenCL:
+- **NVIDIA:** install the [CUDA toolkit](https://developer.nvidia.com/cuda-downloads) — includes OpenCL
+- **AMD:** install ROCm or the AMDGPU-PRO driver
+- **Intel integrated graphics:** `sudo apt install intel-opencl-icd`
+
+If CMake cannot locate OpenCL automatically (no CUDA toolkit installed), pass the path manually:
+
+```bash
+cmake -S . -B ../build -DOpenCL_ROOT=/usr
+```
+
+**Build and run `parallel_worlds_3`:**
+
+```bash
+cd parallel_worlds_3/src
+cmake -S . -B ../build
+cmake --build ../build
+cd ../build
+./parallel_worlds_3                          # live camera
+./parallel_worlds_3 --image /path/to/img.jpg # still image
+```
+
+**Build and run `parallel_worlds_2_cuda`** (NVIDIA GPU required):
+
+```bash
+cd parallel_worlds_2_cuda/src
+cmake -S . -B ../build
+cmake --build ../build
+cd ../build
+./parallel_worlds                            # reads preview.png from build dir
+```
+
+> If your GPU is not Turing (SM 75), edit `CMAKE_CUDA_ARCHITECTURES` in `CMakeLists.txt` to match your GPU generation before building.
+
+---
+
+### Windows — not tested; instructions based on code
+
+The `CMakeLists.txt` has a separate MSVC flag block (`/arch:SSE2`) so the ARM64 fix does not affect Windows.
+
+**Install dependencies:**
+
+- [CMake](https://cmake.org/download/) ≥ 3.12
+- Visual Studio 2019 or 2022 with the "Desktop development with C++" workload
+- [OpenCV Windows release](https://opencv.org/releases/) — note the path to the directory containing `OpenCVConfig.cmake`
+- OpenCL via your GPU driver:
+  - **NVIDIA:** install the [CUDA toolkit](https://developer.nvidia.com/cuda-downloads)
+  - **AMD/Intel:** install the respective GPU driver, which includes an OpenCL ICD
+
+**Build `parallel_worlds_3` (Developer Command Prompt):**
+
+```bat
+cd parallel_worlds_3\src
+cmake -S . -B ..\build -DOpenCV_DIR="C:\path\to\opencv\build"
+cmake --build ..\build --config Release
+```
+
+**Run:**
+
+```bat
+cd ..\build\Release
+parallel_worlds_3.exe                           # live camera
+parallel_worlds_3.exe --image C:\path\to\img.jpg  # still image
+```
+
+> The executable is placed in `build\Release\` or `build\Debug\` depending on the config. The post-build step copies `src\` and `preview.png` alongside it automatically.
+
+---
+
+## Input behaviour (`parallel_worlds_3`)
+
+When launched without `--image`:
+1. Tries to open webcam device `0`
+2. If no camera found, reads `preview.png` from the working directory
+3. If neither available, exits with code 3
+
+The `--image` flag accepts any path and any image format supported by OpenCV (JPEG, PNG, BMP, etc.). When `--image` is used, the camera is not opened.
+
+---
+
+## Tuning the dehazing (`parallel_worlds_3`)
+
+The constructor call in `main.cpp` exposes three parameters:
+
+```cpp
+DehazeFilter dehazeFilter(defaultDevice, "src/dehazeFilters.cl",
+    /* patchHalf */ 7,     // neighbourhood size = (2×7+1)² = 15×15 pixels
+    /* omega     */ 0.75f, // haze removal strength: higher = more aggressive
+    /* tMin      */ 0.2f   // transmission floor: lower = more amplification in darks
+);
+```
+
+For genuinely hazy/foggy images, `omega = 0.95f` and `tMin = 0.1f` give stronger removal. The defaults (0.75 / 0.2) are tuned for scenes without real haze (indoor webcam).
