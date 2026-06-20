@@ -32,7 +32,7 @@ __host__ int main(int argc, const char** argv) {
 		}
 	} else {
 		capture.open(0); //0=default, -1=any camera, 1..99=your camera
-		cameraOn = capture.isOpened() && false; // force static image; set to capture.isOpened() to enable camera
+		cameraOn = capture.isOpened();
 		if (cameraOn) {
 			if (!capture.read(frame))
 				exit(3);
