@@ -1,0 +1,118 @@
+================================================================================
+  FUTURE OPTIMIZATION: Parallel Reduction Tree for computeAtmLight (GPU)
+================================================================================
+
+FILE TO CHANGE: parallel_worlds_3_cuda_dehazing/src/DehazeFilter.cu + DehazeFilter.hpp
+
+--------------------------------------------------------------------------------
+WHAT IS THE PROBLEM RIGHT NOW?
+--------------------------------------------------------------------------------
+
+After the darkChannelKernel runs on the GPU and produces `dDark`, the current
+code does this every single frame:
+
+  1. cudaMemcpy   dDark (GPU) --> darkHost (CPU)      [GPU->CPU transfer, ~0.5 MB]
+  2. std::nth_element on darkHost                     [CPU serial sort, O(N)]
+  3. for-loop over all pixels to sum qualifying ones  [CPU serial loop, O(N)]
+  4. Continue with GPU passes 2 & 3
+
+Steps 2-3 force a full GPU->CPU->GPU round trip EVERY FRAME. This is a pipeline
+stall -- the GPU sits idle while the CPU does serial work. On a 640x480 image
+that's ~300,000 pixels the CPU has to touch twice per frame.
+
+--------------------------------------------------------------------------------
+WHAT IS A PARALLEL REDUCTION TREE?
+--------------------------------------------------------------------------------
+
+A reduction tree is a GPU pattern for combining N values into 1 result in
+O(log N) parallel steps instead of O(N) serial steps.
+
+Example: finding the maximum of 8 values
+
+  Level 0 (8 threads): [12] [5] [9] [3] [17] [2] [8] [11]
+  Level 1 (4 threads): [max(12,5)=12] [max(9,3)=9] [max(17,2)=17] [max(8,11)=11]
+  Level 2 (2 threads): [max(12,9)=12]              [max(17,11)=17]
+  Level 3 (1 thread):  [max(12,17) = 17]  <-- global max, done in 3 steps
+
+For N=300,000 pixels this takes only log2(300,000) ≈ 18 GPU steps instead of
+300,000 CPU steps. And it all stays on the GPU -- no transfer needed.
+
+--------------------------------------------------------------------------------
+HOW TO APPLY THIS TO computeAtmLight
+--------------------------------------------------------------------------------
+
+Replace the current CPU computeAtmLight() with two GPU reduction passes:
+
+  PASS A -- find brightness threshold (top 0.1%)
+  -------------------------------------------------
+  Kernel 1: Each thread computes max dark-channel value in its chunk (block-level max).
+            Write one max value per block to a partial-results buffer.
+  Kernel 2: Reduce partial results to a single global max.
+            Then compute threshold = (global_max * 999) / 1000 approx.
+  -- OR use a histogram reduction instead (256-bin histogram -> prefix sum -> threshold)
+
+  PASS B -- sum qualifying channel values (atmospheric light)
+  ------------------------------------------------------------
+  Kernel 3: Each thread: if dark[i] >= threshold, add color[i*3+0/1/2] to
+            shared-memory accumulators. Use atomic add to combine block results
+            into global sum buffers (sumB, sumG, sumR, count).
+  Kernel 4: Divide sums by count to get atmLight[0..2]. Copy 4 floats to CPU.
+
+  This replaces the GPU->CPU transfer of 300,000 bytes with a transfer of only
+  4 floats (16 bytes) -- 18,750x less data over the PCIe bus.
+
+--------------------------------------------------------------------------------
+APPROXIMATE IMPLEMENTATION SKETCH
+--------------------------------------------------------------------------------
+
+// --- Kernel A: per-block partial max of dark channel ---
+__global__ void partialMaxKernel(const unsigned char *dark, unsigned int *blockMaxes, unsigned int n) {
+    extern __shared__ unsigned int sdata[];
+    unsigned int tid = threadIdx.x;
+    unsigned int i   = blockIdx.x * blockDim.x + threadIdx.x;
+    sdata[tid] = (i < n) ? dark[i] : 0;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {  // <-- the "tree"
+        if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    if (tid == 0) blockMaxes[blockIdx.x] = sdata[0];
+}
+
+// --- Kernel B: sum qualifying pixels per channel ---
+__global__ void atmLightSumKernel(const unsigned char *dark,
+                                  const unsigned char *color,
+                                  unsigned int n,
+                                  unsigned char thresh,
+                                  unsigned long *sumB, unsigned long *sumG,
+                                  unsigned long *sumR, unsigned long *count) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && dark[i] >= thresh) {
+        atomicAdd((unsigned long long*)sumB, (unsigned long long)color[i * 3]);
+        atomicAdd((unsigned long long*)sumG, (unsigned long long)color[i * 3 + 1]);
+        atomicAdd((unsigned long long*)sumR, (unsigned long long)color[i * 3 + 2]);
+        atomicAdd((unsigned long long*)count, 1ULL);
+    }
+}
+
+// Then on CPU: just read back 4 values (sumB, sumG, sumR, count) and divide.
+
+--------------------------------------------------------------------------------
+EXPECTED SPEEDUP
+--------------------------------------------------------------------------------
+
+Current:    GPU->CPU: ~0.5 MB transfer + CPU serial work (N iterations)
+Optimized:  GPU->CPU: 16 bytes transfer + GPU parallel log(N) work
+
+For a 1280x720 frame: ~2.76 MB transfer eliminated every frame.
+At 30 fps: ~83 MB/s of PCIe bandwidth saved, plus the CPU stall removed.
+Net effect: the dehazing filter can sustain real-time performance at higher
+resolutions and with larger patch sizes.
+
+--------------------------------------------------------------------------------
+ESTIMATED IMPLEMENTATION EFFORT
+--------------------------------------------------------------------------------
+~2 new kernel functions + ~50 lines of host code changes in DehazeFilter.cu
+DehazeFilter.hpp: add device buffers for blockMaxes, sumB/G/R, count
+
+================================================================================

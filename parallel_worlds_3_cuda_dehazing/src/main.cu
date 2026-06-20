@@ -10,7 +10,8 @@
 GreyFilter   greyFilter(3, 1);
 SobelFilter  sobelFilter(1, 1);
 EffectFilter effectFilter(3, 1, 3);
-DehazeFilter dehazeFilter(7, 0.75f, 0.2f);
+// patchHalf=7 (15x15 patch), omega=0.90 (aggressive), tMin=0.10, gamma=1.3 (mild brightening)
+DehazeFilter dehazeFilter(7, 0.90f, 0.10f, 1.30f);
 
 __host__ int main(int argc, const char** argv) {
 	// optional: --image <path>  forces a still image instead of the camera
