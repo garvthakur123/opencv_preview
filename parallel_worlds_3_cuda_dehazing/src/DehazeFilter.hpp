@@ -68,7 +68,7 @@ protected:
 
         // only stretch when image is noticeably darker than target brightness;
         // cap scale at 4× to avoid amplifying sensor noise in very dark shots
-        const unsigned char targetBright = 220;
+        const unsigned char targetBright = 180;
         float scale = (p99 > 10 && p99 < targetBright)
                       ? std::min(static_cast<float>(targetBright) / p99, 4.0f)
                       : 1.0f;
