@@ -1,28 +1,33 @@
 /*
  * DehazeFilter.cu
  *
- * CUDA port of dehazeFilters.cl (opencv_preview1/parallel_worlds_3).
  * Dark Channel Prior dehazing — He et al., CVPR 2009.
  *
- * Three GPU passes:
- *   1. darkChannelKernel          : min BGR value over local patch -> dark map
- *   2. estimateTransmissionKernel : normalize by atm light, run dark channel -> t map
- *   3. recoverRadianceKernel      : J = (I - A) / max(t, tMin) + A -> dehazed BGR
+ * GPU passes:
+ *   1. darkChannelKernel          : min BGR over local patch -> dark map
+ *   2. histogramKernel            : 256-bin histogram of dark map (shared mem)
+ *      atmLightSumKernel          : BGR sums of top-0.1% pixels (atomicAdd)
+ *      [CPU: threshold from 1024-byte histogram + atmLight from 32-byte sums]
+ *   3. estimateTransmissionKernel : normalize by A, dark channel -> t map
+ *   4. recoverRadianceKernel      : J = (I-A)/max(t,tMin) + A -> dehazed BGR
  *
- * Between pass 1 and 2 the dark map is downloaded to the CPU so that
- * computeAtmLight() (defined in DehazeFilter.hpp) can derive the atmospheric
- * light estimate.
+ * PCIe transfers per frame:
+ *   Old: ~300 KB (full dark channel downloaded to CPU)
+ *   New:   1 KB  (256 histogram bins + 4 sums = 1056 bytes)
  */
 
 #include "DehazeFilter.hpp"
 
+// block size for 1-D kernels (histogram + sum); must be >= 256
+static const unsigned int ATM_BLOCK = 256;
+
 // ----- Pass 1 ---------------------------------------------------------------
 // Compute the dark channel: for each pixel, find the minimum value across all
 // three BGR channels within a (2*patchHalf+1)^2 neighbourhood.
-// @param inImg    BGR input, 3 bytes per pixel
-// @param darkOut  1-byte-per-pixel dark channel output
-// @param w/h      image dimensions
-// @param patchHalf  half-size of the patch window (e.g. 7 -> 15x15 window)
+// @param inImg     BGR input, 3 bytes per pixel
+// @param darkOut   1-byte-per-pixel dark channel output
+// @param w/h       image dimensions
+// @param patchHalf half-size of the patch window (e.g. 7 -> 15x15 window)
 __global__ void darkChannelKernel(const unsigned char *inImg,
                                   unsigned char *darkOut,
                                   unsigned int w, unsigned int h,
@@ -50,17 +55,61 @@ __global__ void darkChannelKernel(const unsigned char *inImg,
     darkOut[y * w + x] = minVal;
 }
 
+// ----- AtmLight GPU step A --------------------------------------------------
+// Build a 256-bin histogram of the dark channel.
+// Uses per-block shared memory to minimise global atomicAdd pressure:
+// each block accumulates into a private 256-bin histogram in shared memory,
+// then merges it into the global histogram with one atomicAdd per bin.
+// @param dark   1-byte-per-pixel dark channel (output of pass 1)
+// @param hist   global 256-bin unsigned int histogram (pre-cleared to 0)
+// @param n      total number of pixels
+__global__ void histogramKernel(const unsigned char *dark,
+                                unsigned int *hist,
+                                unsigned int n)
+{
+    // private histogram for this block (256 bins, lives in shared memory)
+    __shared__ unsigned int localHist[256];
+    if (threadIdx.x < 256) localHist[threadIdx.x] = 0;
+    __syncthreads();
+
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        atomicAdd(&localHist[dark[i]], 1);
+    __syncthreads();
+
+    // merge block histogram into global histogram (256 atomicAdds per block)
+    if (threadIdx.x < 256)
+        atomicAdd(&hist[threadIdx.x], localHist[threadIdx.x]);
+}
+
+// ----- AtmLight GPU step B --------------------------------------------------
+// Sum the BGR values of every pixel whose dark-channel value >= thresh.
+// Results accumulated into sums[0..2] (sumB, sumG, sumR) and sums[3] (count).
+// @param dark   1-byte-per-pixel dark channel
+// @param color  BGR input, 3 bytes per pixel (same data that dInput holds)
+// @param n      total number of pixels
+// @param thresh brightness threshold from the histogram step
+// @param sums   [sumB, sumG, sumR, count], all unsigned long long (pre-cleared)
+__global__ void atmLightSumKernel(const unsigned char *dark,
+                                  const unsigned char *color,
+                                  unsigned int n,
+                                  unsigned char thresh,
+                                  unsigned long long *sums)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && dark[i] >= thresh) {
+        atomicAdd(&sums[0], (unsigned long long)color[i * 3]);
+        atomicAdd(&sums[1], (unsigned long long)color[i * 3 + 1]);
+        atomicAdd(&sums[2], (unsigned long long)color[i * 3 + 2]);
+        atomicAdd(&sums[3], 1ULL);
+    }
+}
+
 // ----- Pass 2 ---------------------------------------------------------------
 // Estimate transmission map: normalise each neighbour pixel by atmospheric
 // light, compute the dark channel of the normalised image, then apply
 //   t(x) = 1 - omega * darkChannel(I/A)(x)
 // Result stored as unsigned char (0 = 0.0, 255 = 1.0).
-// @param inImg    BGR input, 3 bytes per pixel
-// @param transOut  1-byte-per-pixel transmission map
-// @param w/h      image dimensions
-// @param atmB/atmG/atmR  atmospheric light per channel in [0,1]
-// @param patchHalf  same window size as darkChannelKernel
-// @param omega    haze retention factor (typically 0.75)
 __global__ void estimateTransmissionKernel(const unsigned char *inImg,
                                            unsigned char *transOut,
                                            unsigned int w, unsigned int h,
@@ -94,12 +143,6 @@ __global__ void estimateTransmissionKernel(const unsigned char *inImg,
 // ----- Pass 3 ---------------------------------------------------------------
 // Recover scene radiance:
 //   J(x) = (I(x) - A) / max(t(x), tMin) + A
-// @param inImg   BGR input, 3 bytes per pixel
-// @param transIn  1-byte transmission map from estimateTransmissionKernel
-// @param outImg  BGR output, 3 bytes per pixel
-// @param w/h     image dimensions
-// @param atmB/atmG/atmR  atmospheric light per channel in [0,1]
-// @param tMin    lower clamp on transmission to avoid division by near-zero
 __global__ void recoverRadianceKernel(const unsigned char *inImg,
                                       const unsigned char *transIn,
                                       unsigned char *outImg,
@@ -125,7 +168,7 @@ __global__ void recoverRadianceKernel(const unsigned char *inImg,
 }
 
 // ---------------------------------------------------------------------------
-// Host operator: orchestrates the three GPU passes and the CPU atm-light step
+// Host operator
 // ---------------------------------------------------------------------------
 __host__ void DehazeFilter::operator()(const unsigned char *input,
                                        unsigned char *output,
@@ -136,7 +179,7 @@ __host__ void DehazeFilter::operator()(const unsigned char *input,
 
     prepareBuffers(w, h);
 
-    // upload BGR frame once; dInput is reused by all three GPU passes
+    // upload BGR frame once; dInput is reused by all GPU passes
     SAFE_CALL(cudaMemcpy(dInput, reinterpret_cast<const void*>(input),
                          bytesIn, cudaMemcpyHostToDevice));
 
@@ -146,10 +189,49 @@ __host__ void DehazeFilter::operator()(const unsigned char *input,
     darkChannelKernel<<<this->grid, this->threads>>>(dInput, dDark, w, h, patchHalf);
     SAFE_CALL(cudaDeviceSynchronize());
 
-    // download dark channel to CPU for atmospheric light estimation
-    std::vector<unsigned char> darkHost(nPix);
-    SAFE_CALL(cudaMemcpy(darkHost.data(), dDark, nPix, cudaMemcpyDeviceToHost));
-    computeAtmLight(darkHost.data(), input, w, h);
+    // ------------------------------------------------------------------
+    // AtmLight — GPU step A: histogram of dark channel
+    // Uses 1-D grid (not the 2-D image grid) since dDark is a flat array.
+    // ------------------------------------------------------------------
+    const unsigned int atmGrid = (nPix + ATM_BLOCK - 1) / ATM_BLOCK;
+
+    SAFE_CALL(cudaMemset(dHist, 0, 256 * sizeof(unsigned int)));
+    histogramKernel<<<atmGrid, ATM_BLOCK>>>(dDark, dHist, nPix);
+    SAFE_CALL(cudaDeviceSynchronize());
+
+    // Download 256 unsigned ints (1024 bytes) to find threshold on CPU.
+    // This is the only large-ish transfer; it replaces the old ~300 KB download.
+    unsigned int hostHist[256];
+    SAFE_CALL(cudaMemcpy(hostHist, dHist,
+                         256 * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+
+    // find brightness threshold = minimum value of the top-0.1% dark pixels
+    const unsigned int nTop = std::max(1u, nPix / 1000);
+    unsigned int cumCount = 0;
+    unsigned char thresh   = 255;
+    for (int v = 255; v >= 0; v--) {
+        cumCount += hostHist[v];
+        if (cumCount >= nTop) { thresh = (unsigned char)v; break; }
+    }
+
+    // ------------------------------------------------------------------
+    // AtmLight — GPU step B: sum BGR of qualifying pixels
+    // ------------------------------------------------------------------
+    SAFE_CALL(cudaMemset(dSums, 0, 4 * sizeof(unsigned long long)));
+    atmLightSumKernel<<<atmGrid, ATM_BLOCK>>>(dDark, dInput, nPix, thresh, dSums);
+    SAFE_CALL(cudaDeviceSynchronize());
+
+    // Download 4 unsigned long longs (32 bytes) and compute atmLight.
+    // All arithmetic here is 3 divisions + 6 clamps — negligible CPU work.
+    unsigned long long hostSums[4];
+    SAFE_CALL(cudaMemcpy(hostSums, dSums,
+                         4 * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+
+    unsigned long long cnt = std::max(1ULL, hostSums[3]);
+    const float capVal = 0.85f;
+    atmLight[0] = std::min(std::max((float)hostSums[0] / (cnt * 255.0f), 1.0f / 255.0f), capVal);
+    atmLight[1] = std::min(std::max((float)hostSums[1] / (cnt * 255.0f), 1.0f / 255.0f), capVal);
+    atmLight[2] = std::min(std::max((float)hostSums[2] / (cnt * 255.0f), 1.0f / 255.0f), capVal);
 
     // ------------------------------------------------------------------
     // Pass 2: estimate transmission  (dInput BGR -> dTrans 1ch)
