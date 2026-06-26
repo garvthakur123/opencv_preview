@@ -6,13 +6,14 @@
 #include "ImageFilter.hpp"
 
 /// Implements Dark Channel Prior dehazing (He et al., CVPR 2009) as a
-/// fully-GPU four-pass CUDA pipeline:
-///   1. darkChannelKernel          (GPU) -> 1-ch dark map
-///   2. histogramKernel            (GPU) -> 256-bin histogram of dark map
+/// fully-GPU CUDA pipeline with three named passes:
+///   Pass 1. darkChannelKernel          (GPU) -> 1-ch dark map
+///   AtmLight sub-steps (between pass 1 and pass 2):
+///      histogramKernel            (GPU) -> 256-bin histogram of dark map
 ///      atmLightSumKernel          (GPU) -> per-channel BGR sums of top pixels
 ///      [CPU: 3 divisions + clamp from 1056-byte download -> atmLight[3]]
-///   3. estimateTransmissionKernel (GPU) -> 1-ch transmission map
-///   4. recoverRadianceKernel      (GPU) -> BGR dehazed output
+///   Pass 2. estimateTransmissionKernel (GPU) -> 1-ch transmission map
+///   Pass 3. recoverRadianceKernel      (GPU) -> BGR dehazed output
 ///
 /// Previously computeAtmLight ran entirely on the CPU, downloading ~300 KB of
 /// dark-channel data per frame.  The GPU histogram + sum approach reduces the
@@ -21,7 +22,7 @@ class DehazeFilter : public ImageFilter {
 protected:
     /// device buffer: 1 byte per pixel (dark channel map from pass 1)
     unsigned char *dDark;
-    /// device buffer: 1 byte per pixel (transmission map from pass 3)
+    /// device buffer: 1 byte per pixel (transmission map from pass 2)
     unsigned char *dTrans;
 
     /// device buffer: 256-bin histogram of the dark channel (fixed size)
@@ -41,11 +42,11 @@ protected:
 
 public:
     /// @param patchHalf_  half-side of the DCP patch window (default 7)
-    /// @param omega_      haze retention factor (default 0.95)
-    /// @param tMin_       minimum transmission clamp (default 0.1)
+    /// @param omega_      haze retention factor (default 0.75)
+    /// @param tMin_       minimum transmission clamp (default 0.2)
     DehazeFilter(unsigned int patchHalf_ = 7,
-                 float omega_            = 0.95f,
-                 float tMin_             = 0.10f)
+                 float omega_            = 0.75f,
+                 float tMin_             = 0.20f)
         : ImageFilter(3, 3),
           dDark(nullptr), dTrans(nullptr),
           dHist(nullptr), dSums(nullptr),

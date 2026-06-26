@@ -4,12 +4,13 @@
  * Dark Channel Prior dehazing — He et al., CVPR 2009.
  *
  * GPU passes:
- *   1. darkChannelKernel          : min BGR over local patch -> dark map
- *   2. histogramKernel            : 256-bin histogram of dark map (shared mem)
+ *   Pass 1. darkChannelKernel          : min BGR over local patch -> dark map
+ *   AtmLight sub-steps (between pass 1 and pass 2):
+ *      histogramKernel            : 256-bin histogram of dark map (shared mem)
  *      atmLightSumKernel          : BGR sums of top-0.1% pixels (atomicAdd)
  *      [CPU: threshold from 1024-byte histogram + atmLight from 32-byte sums]
- *   3. estimateTransmissionKernel : normalize by A, dark channel -> t map
- *   4. recoverRadianceKernel      : J = (I-A)/max(t,tMin) + A -> dehazed BGR
+ *   Pass 2. estimateTransmissionKernel : normalize by A, dark channel -> t map
+ *   Pass 3. recoverRadianceKernel      : J = (I-A)/max(t,tMin) + A -> dehazed BGR
  *
  * PCIe transfers per frame:
  *   Old: ~300 KB (full dark channel downloaded to CPU)
@@ -235,6 +236,7 @@ __host__ void DehazeFilter::operator()(const unsigned char *input,
 
     // ------------------------------------------------------------------
     // Pass 2: estimate transmission  (dInput BGR -> dTrans 1ch)
+    // dTrans holds 1-byte-per-pixel transmission map; written here, read in pass 3
     // ------------------------------------------------------------------
     estimateTransmissionKernel<<<this->grid, this->threads>>>(
         dInput, dTrans, w, h,
@@ -244,6 +246,7 @@ __host__ void DehazeFilter::operator()(const unsigned char *input,
 
     // ------------------------------------------------------------------
     // Pass 3: recover radiance  (dInput + dTrans -> dOutput)
+    // reads dTrans written by pass 2
     // ------------------------------------------------------------------
     recoverRadianceKernel<<<this->grid, this->threads>>>(
         dInput, dTrans, dOutput, w, h,
